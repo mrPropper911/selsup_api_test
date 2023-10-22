@@ -9,6 +9,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import lombok.experimental.FieldNameConstants;
+import org.apache.commons.lang3.concurrent.TimedSemaphore;
 import org.apache.log4j.LogManager;
 import org.apache.log4j.Logger;
 
@@ -26,21 +27,23 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.*;
 
+@Data
 public class CrptApi {
 
     private static final String URL_API = "https://ismp.crpt.ru";
 
     private static final ObjectMapper objectMapper = new ObjectMapper();
-    private static final ScheduledExecutorService executorService = Executors.newScheduledThreadPool(1);
     private static final Logger log = LogManager.getLogger(CrptApi.class);
-    private static volatile ScheduledFuture<?> task;
-    private static int currentNumberOfConnection = 0;
+
     private static String responseValue = null;
     private final TimeUnit timeUnit;
     private final int requestLimit;
+    private final ExecutorService exService;
+    private final TimedSemaphore timedSemaphore;
     private Authentication authentication;
 
-    public CrptApi(TimeUnit timeUnit, int requestLimit) {
+
+    public CrptApi(long timePeriod, TimeUnit timeUnit, int requestLimit) {
         if (requestLimit < 0) {
             log.error("Request limit should be positive");
             throw new IllegalArgumentException("Request limit should be positive");
@@ -48,117 +51,112 @@ public class CrptApi {
         this.timeUnit = timeUnit;
         this.requestLimit = requestLimit;
         this.authentication = new Authentication();
+        this.exService = Executors.newFixedThreadPool(requestLimit);
+        this.timedSemaphore = new TimedSemaphore(timePeriod, timeUnit, requestLimit);
     }
 
-    public static void main(String[] args) throws InterruptedException {
+    public static void main(String[] args) {
+        CrptApi.test();
+    }
 
-        CrptApi crptApi = new CrptApi(TimeUnit.SECONDS, 5);//todo
-        TimeUnit timeUnit1 = crptApi.getTimeUnit();
-        long l = timeUnit1.toSeconds(1);
-
-        Document document = Document.builder()
+    /**
+     * <p>Example of working
+     *
+     * <p>Creating an entity {@link CrptApi} with a time interval{TIME_INTERVAL}
+     * and the maximum number of requests in this time interval{MAX_NUMBER_OF_REQUEST}.
+     * Creating test {@link Document} and test {@link Signature}.
+     * Starting a document creation request cycle with a delay of 1 second for {COUNT_OF_REQUEST} threads
+     */
+    private static void test() {
+        int TIME_INTERVAL = 10;
+        int MAX_NUMBER_OF_REQUEST = 5;
+        short COUNT_OF_REQUEST = 100;
+        CrptApi testCrptApi = new CrptApi(TIME_INTERVAL, TimeUnit.SECONDS, MAX_NUMBER_OF_REQUEST);
+        Signature testSignature = new Signature();
+        Document testDocument = Document.builder()
                 .productGroup(ProductGroup.mapOfProductGroup.get(8))
-                .productDocument(ProductDocument.builder().dateFrom("Test").build())
+                .productDocument(ProductDocument.builder()
+                        .number("Number_Test_1")
+                        .dateFrom("DateFrom_Test_1")
+                        .build())
                 .documentFormat(DocumentFormat.MANUAL)
                 .type(DocumentType.LK_CONTRACT_COMMISSIONING)
                 .build();
 
-        Signature signature = new Signature();
-
-        crptApi.initRepeatableTask(document, signature);
-
-
-    }
-
-    public TimeUnit getTimeUnit() {
-        return timeUnit;
-    }
-
-    public int getRequestLimit() {
-        return requestLimit;
-    }
-
-    public void initRepeatableTask(Document document, Signature signature) {
-        task = executorService.scheduleWithFixedDelay(() -> {
-            ++currentNumberOfConnection;
-            responseValue = putIntoCirculationGoodsProducedOnRussia(document, signature);
-            if (responseValue != null) {
-                currentNumberOfConnection = getRequestLimit();
-            }
-        }, 0, getThreadSleepOnSecond(), getTimeUnit());
-
-
-        while (true) {
-            Thread.onSpinWait();
-            if (currentNumberOfConnection == getRequestLimit()) {
-                task.cancel(true);
-                executorService.shutdown();
-                break;
+        ExecutorService executorService = Executors.newFixedThreadPool(COUNT_OF_REQUEST);
+        for (int i = 0; i < COUNT_OF_REQUEST; i++) {
+            try {
+                Thread.sleep(1000);
+                executorService.submit(() -> {
+                    Future<String> stringFuture = testCrptApi.putIntoCirculationGoodsProducedOnRussia(testDocument, testSignature);
+                    try {
+                        String result = stringFuture.get();
+                        log.info("Unique document ID: " + (result == null ? "Receiving error" : result));
+                    } catch (InterruptedException | ExecutionException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+            } catch (InterruptedException e) {
+                throw new RuntimeException(e);
             }
         }
-
-        System.out.println(responseValue + " --");
-        int i = 0;
     }
 
+    /**
+     * <p> Creation of a document for putting into circulation goods produced in the Russian Federation
+     *
+     * @param document  - {@link Document }
+     * @param signature - {@link Signature}
+     * @return Unique document identifier or null if have error
+     */
+    private Future<String> putIntoCirculationGoodsProducedOnRussia(Document document, Signature signature) {
+        return exService.submit(() -> {
+            timedSemaphore.acquire();
 
-    private int getThreadSleepOnSecond() {
-        long timeDuration = 0;
-        //todo comment
-        if (this.timeUnit == TimeUnit.SECONDS) {
-            timeDuration = this.timeUnit.toSeconds(30);
-        } else {
-            timeDuration = this.timeUnit.toSeconds(1);
-        }
-        return (int) (timeDuration / this.requestLimit);
-
-    }
-
-    private String putIntoCirculationGoodsProducedOnRussia(Document document, Signature signature) {
-        if (document.getType() != DocumentType.LK_CONTRACT_COMMISSIONING &&
-                document.getType() != DocumentType.LK_CONTRACT_COMMISSIONING_CSV &&
-                document.getType() != DocumentType.LK_CONTRACT_COMMISSIONING_XML) {
-            log.error("Ilegual document type, provide type: LK_CONTRACT_COMMISSIONING...");
-            throw new IllegalArgumentException("Ilegual document type");
-        }
-
-        try {
-            String jsonProductDocument = objectMapper.writeValueAsString(document.getProductDocument());
-            document.setProductDocument(null);//clear for security data
-            String jsonProductDocumentBase64 = Base64.getEncoder().encodeToString(jsonProductDocument.getBytes());
-
-            JsonNode jsonNodeDocument = objectMapper.valueToTree(document);
-            ((ObjectNode) jsonNodeDocument).put("signature", Base64.getEncoder().encode(signature.getElectronSignature().getBytes()));
-            ((ObjectNode) jsonNodeDocument).put("product_document", jsonProductDocumentBase64);
-            String jsonBody = objectMapper.writeValueAsString(jsonNodeDocument);
-
-            authentication = Authentication.getAuthenticationToken(authentication);
-
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(URL_API + "/api/v3/lk/documents/create?pg=" + document.getProductGroup()))
-                    .setHeader("Content-Type", "application/json")
-                    .setHeader("Authorization", authentication.getToken())
-                    .POST(HttpRequest.BodyPublishers.ofString(Objects.requireNonNull(jsonBody)))
-                    .build();
-
-            HttpClient httpClient = HttpClient.newBuilder()
-                    .version(HttpClient.Version.HTTP_1_1)
-                    .connectTimeout(Duration.ofSeconds(10))
-                    .build();
-
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 200) {
-                JsonNode jsonNode = objectMapper.readTree(response.body());
-                log.info("Document ");
-                return jsonNode.get("value").asText();
-            } else {
-                log.info("Status code: " + response.statusCode() + " {" + response.body() + "}");
-                return null;
+            if (document.getType() != DocumentType.LK_CONTRACT_COMMISSIONING &&
+                    document.getType() != DocumentType.LK_CONTRACT_COMMISSIONING_CSV &&
+                    document.getType() != DocumentType.LK_CONTRACT_COMMISSIONING_XML) {
+                log.error("Ilegual document type, provide type: LK_CONTRACT_COMMISSIONING...");
+                throw new IllegalArgumentException("Ilegual document type");
             }
-        } catch (Exception e) {
-            log.error("An error was received while saving the document: " + e.getMessage());
-            throw new RuntimeException("An error was received while saving the document");
-        }
+
+            try {
+                String jsonProductDocument = objectMapper.writeValueAsString(document.getProductDocument());
+                document.setProductDocument(null);//clear for security data
+                String jsonProductDocumentBase64 = Base64.getEncoder().encodeToString(jsonProductDocument.getBytes());
+
+                JsonNode jsonNodeDocument = objectMapper.valueToTree(document);
+                ((ObjectNode) jsonNodeDocument).put("signature", Base64.getEncoder().encode(signature.getElectronSignature().getBytes()));
+                ((ObjectNode) jsonNodeDocument).put("product_document", jsonProductDocumentBase64);
+                String jsonBody = objectMapper.writeValueAsString(jsonNodeDocument);
+
+                authentication = Authentication.getAuthenticationToken(authentication);
+
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(URL_API + "/api/v3/lk/documents/create?pg=" + document.getProductGroup()))
+                        .setHeader("Content-Type", "application/json")
+                        .setHeader("Authorization", authentication.getToken())
+                        .POST(HttpRequest.BodyPublishers.ofString(Objects.requireNonNull(jsonBody)))
+                        .build();
+
+                HttpClient httpClient = HttpClient.newBuilder()
+                        .version(HttpClient.Version.HTTP_1_1)
+                        .connectTimeout(Duration.ofSeconds(10))
+                        .build();
+
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+                if (response.statusCode() == 200) {
+                    JsonNode jsonNode = objectMapper.readTree(response.body());
+                    return jsonNode.get("value").asText();
+                } else {
+                    log.info("Status code: " + response.statusCode() + " { " + response.body() + " }");
+                    return null;
+                }
+            } catch (Exception e) {
+                log.error("An error was received while saving the document: " + e.getMessage());
+                throw new RuntimeException("An error was received while saving the document");
+            }
+        });
     }
 
     enum DocumentType {
